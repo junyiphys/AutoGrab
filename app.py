@@ -1,139 +1,190 @@
-# app.py
 import streamlit as st
+import requests
+from bs4 import BeautifulSoup
 import pandas as pd
-import time
 import re
+import time
+from urllib.parse import urljoin
 
-# 匯入我們拆分出去的模組
-from config import KEYWORDS_MAP
-import scrapers # 匯入整個 scrapers 模組
+# ==========================================
+# 1. 設定檔與全域變數
+# ==========================================
 
-def parse_custom_keywords(text_input):
-    """解析使用者輸入的自訂關鍵字"""
-    custom_map = {}
-    if not text_input:
-        return custom_map
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+}
+
+# 您可以在這裡自由增加想要監控的作品
+KEYWORDS_MAP = {
+    "排球少年": ["ハイキュー", "ＨＱ"],
+    "藍色監獄": ["ブルーロック", "ブルロ"],
+    "咒術迴戰": ["呪術廻戦", "呪術"],
+    "間諜家家酒": ["SPY×FAMILY", "スパイファミリー"],
+    "吉伊卡哇": ["ちいかわ"],
+    "我的英雄學院": ["僕のヒーローアカデミア", "ヒロアカ"],
+    "海賊王": ["ONE PIECE", "ワンピース"],
+    "銀魂": ["銀魂"],
+    "獵人": ["HUNTER×HUNTER"],
+    "怪獸8號": ["怪獣8号", "怪獣８号"]
+}
+
+# ==========================================
+# 2. 工具函數
+# ==========================================
+
+def is_match(title, target_keywords):
+    """檢查標題是否包含任一目標關鍵字"""
+    if not target_keywords: return True 
+    for k in target_keywords:
+        if k in title:
+            return True
+    return False
+
+# ==========================================
+# 3. 爬蟲邏輯 (Liblo 專用 - 無翻譯版)
+# ==========================================
+
+def fetch_liblo(target_count, max_scan_limit, target_keywords, status_container):
+    """
+    [Liblo] 邊爬邊過濾
+    """
+    base_url = "https://goods.liblo.jp/"
+    current_url = base_url
     
-    lines = text_input.strip().split('\n')
-    for line in lines:
-        # 支援全形與半形冒號
-        if ':' in line or '：' in line:
-            parts = re.split(r'[:：]', line, 1)
-            category = parts[0].strip()
-            keywords_str = parts[1].strip()
-            # 支援用逗號、頓號、空格分隔
-            keywords = [k.strip() for k in re.split(r'[,、\s]+', keywords_str) if k.strip()]
-            if category and keywords:
-                custom_map[category] = keywords
-    return custom_map
+    found_items = []
+    total_scanned = 0
+    page = 1
+    
+    while len(found_items) < target_count and total_scanned < max_scan_limit:
+        status_container.text(f"正在搜尋第 {page} 頁 (已找到 {len(found_items)}/{target_count} 筆符合)...")
+        
+        try:
+            res = requests.get(current_url, headers=HEADERS, timeout=10)
+            res.encoding = 'utf-8'
+            soup = BeautifulSoup(res.text, 'html.parser')
+            
+            entries = soup.select('h1.article-title a, h3.article-title a, div.main-content h3 a')
+            
+            if not entries:
+                break
+
+            for entry in entries:
+                if total_scanned >= max_scan_limit: break
+                total_scanned += 1
+                
+                title = entry.get_text(strip=True)
+                
+                # 關鍵字比對
+                if is_match(title, target_keywords):
+                    found_items.append({
+                        "Title": title, # 日文原名
+                        "Link": entry.get('href')
+                    })
+                    
+                    if len(found_items) >= target_count:
+                        return found_items
+
+            if len(found_items) >= target_count:
+                break
+
+            # 翻頁邏輯
+            next_btn = soup.select_one('.pager-next a, .next a, a[rel="next"]')
+            if not next_btn:
+                links = soup.find_all('a')
+                for l in links:
+                    if "次へ" in l.get_text() or "Next" in l.get_text():
+                        next_btn = l
+                        break
+            
+            if next_btn:
+                next_link = next_btn.get('href')
+                current_url = urljoin(base_url, next_link)
+                page += 1
+                time.sleep(1) # 避免翻頁過快
+            else:
+                break 
+
+        except Exception as e:
+            st.error(f"連線錯誤: {e}")
+            break
+            
+    return found_items
+
+# ==========================================
+# 4. 主程式介面
+# ==========================================
 
 def main():
-    st.set_page_config(page_title="動漫周邊全網搜", layout="wide", page_icon="🛍️")
-    st.title("🛍️ 動漫周邊全網搜 (Animate/Liblo)")
+    st.set_page_config(page_title="動漫情報看板 (Liblo)", layout="wide", page_icon="🎌")
+    st.title("🎌 日本動漫情報看板")
 
-    # 側邊欄
-    st.sidebar.header("🔍 篩選設定")
-
-    custom_keywords_input = st.sidebar.text_area(
-        "新增分類與關鍵字 (一行一組):",
-        placeholder="範例格式：\n我推的孩子: 推しの子\n新番A: 關鍵字1, 關鍵字2",
-        height=100
-    )
-    custom_map = parse_custom_keywords(custom_keywords_input)
-    combined_keywords_map = {**KEYWORDS_MAP, **custom_map}
-
-    selected_cats = st.sidebar.multiselect(
-        "選擇關注作品 (可複選):",
-        options=list(combined_keywords_map.keys()),
-        default=["排球少年", "藍色監獄"]
-    )
-    
-    st.sidebar.markdown("---")
-
-    days_to_fetch = st.sidebar.number_input(
-        "爬取最近幾天的情報(0為不限):",
-        min_value=0, # 0 代表不限時間
-        max_value=30,
-        value=7,
-        step=1,
-        help="設定要回溯的天數。輸入 0 表示不限制時間。此設定目前僅對 Liblo (情報) 生效。"
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.info("資料來源版本 v0.12")
-
-    if st.button("🚀 開始全網搜索", type="primary"):
-        status_text = st.empty()
-        status_text.info("🚀 啟動並行爬蟲模組，請稍候...")
+    with st.sidebar:
+        st.header("⚙️ 搜尋設定")
         
-        all_results = []
+        target_count = st.number_input(
+            "🎯 目標顯示筆數:",
+            min_value=1, max_value=200, value=20,
+        )
+        
+        max_scan_limit = st.number_input(
+            "🛑 最大搜索上限:",
+            min_value=50, max_value=5000, value=1000,
+            step=50,
+            help="為了湊滿筆數，最多允許爬蟲檢查幾篇文章。"
+        )
+
+        st.markdown("---")
+        selected_cats = st.multiselect(
+            "🔍 選擇關注作品:",
+            options=list(KEYWORDS_MAP.keys()),
+            default=["排球少年", "藍色監獄"],
+        )
+        
+    if st.button("🚀 啟動搜尋", type="primary", use_container_width=True):
+        
+        status_area = st.empty()
         progress_bar = st.progress(0)
         
-        # 定義要執行的爬蟲函式 (循序執行)
-        scraper_funcs = {
-            "Liblo": scrapers.fetch_liblo,
-            "Animate": scrapers.fetch_animate,
-        }
+        # 準備關鍵字
+        target_cats = selected_cats if selected_cats else KEYWORDS_MAP.keys()
+        flat_keywords = []
+        for cat in target_cats:
+            flat_keywords.extend(KEYWORDS_MAP[cat])
         
-        total_scrapers = len(scraper_funcs)
-        for i, (name, func) in enumerate(scraper_funcs.items()):
-            status_text.info(f"⏳ 正在抓取 {name} 的資料... ({i + 1}/{total_scrapers})")
-            try:
-                result = func(days_to_fetch)
-                all_results.extend(result)
-            except Exception as e:
-                error_message = f"{name} 執行時發生未預期錯誤: {e}"
-                print(error_message)
-                all_results.append({"Source": name, "Title": f"⚠️ {error_message}", "Price": "-", "Link": "#"})
-            
-            progress_bar.progress((i + 1) / total_scrapers)
-
-        status_text.success("✅ 所有網站資料搜集完畢，正在整理結果...")
+        # 執行爬蟲
+        status_area.text("正在連線至 goods.liblo.jp ...")
+        results = fetch_liblo(target_count, max_scan_limit, flat_keywords, status_area)
+        progress_bar.progress(100)
+        status_area.empty()
         
-        # 過濾邏輯
-        final_data = []
-        target_cats = selected_cats if selected_cats else list(combined_keywords_map.keys())
-        
-        for item in all_results:
-            title = item['Title']
+        if results:
+            df = pd.DataFrame(results)
             
-            # 優先處理並顯示爬蟲錯誤訊息
-            if "⚠️" in title:
-                item['Category'] = "爬蟲狀態"
-                final_data.append(item)
-                continue
-
-            # 根據選擇的分類和關鍵字進行不分大小寫的過濾
-            for cat in target_cats:
-                keywords = combined_keywords_map.get(cat, [])
-                # 使用 .lower() 進行不分大小寫比對，更具彈性
-                if any(k.lower() in title.lower() for k in keywords):
-                    item['Category'] = cat
-                    final_data.append(item)
-                    break # 找到分類後就跳出，避免重複加入
-        
-        # 顯示結果
-        if final_data:
-            df = pd.DataFrame(final_data)
+            # 分類標籤補完
+            def assign_category(title):
+                for cat in target_cats:
+                    if any(k in title for k in KEYWORDS_MAP[cat]):
+                        return cat
+                return "其他"
             
-            # 篩選出非錯誤狀態的資料來計算數量
-            valid_df = df[df['Category'] != '爬蟲狀態']
+            df['Category'] = df['Title'].apply(assign_category)
             
-            cols = st.columns(2)
-            cols[0].metric("Liblo", len(valid_df[valid_df['Source'].str.contains("Liblo")]))
-            cols[1].metric("Animate", len(valid_df[valid_df['Source'].str.contains("Animate")]))
+            st.success(f"搜尋完成！找到 {len(df)} 筆資料。")
             
+            # 顯示表格 (已移除翻譯欄位)
             st.dataframe(
-                df[["Category", "Source", "Title", "Price", "Link"]],
+                df[["Category", "Title", "Link"]],
                 column_config={
-                    "Link": st.column_config.LinkColumn("商品連結"),
-                    "Title": st.column_config.TextColumn("商品名稱", width="large"),
+                    "Category": st.column_config.TextColumn("作品分類", width="small"),
+                    "Title": st.column_config.TextColumn("商品名稱 (日文原名)", width="large"),
+                    "Link": st.column_config.LinkColumn("連結", display_text="查看情報"),
                 },
                 use_container_width=True,
                 hide_index=True
             )
         else:
-            st.warning("無符合條件商品。")
+            st.warning("沒有找到符合條件的情報。")
 
 if __name__ == "__main__":
     main()
